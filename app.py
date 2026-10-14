@@ -1,11 +1,9 @@
 """
-app.py — Streamlit interface for the 64x64 RGB Diffusion Denoising Application.
+app.py — Interactive Streamlit application supporting both v1 CNN and v2 U-Net architectures.
 Course: Data, Technology and Design (Term 7, 2026)
-
-Workflow:
-  Open App -> Upload Image -> Add Noise -> Reconstruct -> View Result & MSE
 """
 
+import os
 import numpy as np
 import streamlit as st
 import torch
@@ -21,8 +19,14 @@ from train import (
     reconstruct_image,
 )
 
+try:
+    from train_unet_v2 import UNetDenoiserV2
+    HAS_UNET_V2 = True
+except ImportError:
+    HAS_UNET_V2 = False
+
 st.set_page_config(
-    page_title="Diffusion Image Denoiser (64×64)",
+    page_title="Diffusion Image Denoiser (v1 CNN & v2 U-Net)",
     page_icon="🏔️",
     layout="wide",
 )
@@ -30,13 +34,13 @@ st.set_page_config(
 st.title("🏔️ Diffusion-Based Image Denoising (64×64 RGB)")
 st.markdown(
     """
-    This application demonstrates the machine learning lifecycle (**PoC → Project → Reproducible → Tested → Packaged → Deployed**)
-    using a diffusion-inspired denoising model based on:
+    This application demonstrates the complete MLOps lifecycle (**PoC → Project → Tested → Packaged → Deployed → Observed → Improved**)
+    using forward diffusion:
     $$\\mathbf{z}_t = \\sqrt{\\alpha_t}\\mathbf{x} + \\sqrt{1 - \\alpha_t}\\boldsymbol{\\epsilon}_t$$
     """
 )
 
-# Sidebar controls
+# 1. 左侧边栏：输入设置
 st.sidebar.header("1. Input Image & Noise Settings")
 uploaded_file = st.sidebar.file_uploader(
     "Upload an image (PNG/JPG) or use default snow mountain:",
@@ -60,17 +64,43 @@ seed = st.sidebar.number_input(
     step=1,
 )
 
+# 2. 左侧边栏：核心双模型架构切换！
+st.sidebar.header("2. Model Architecture Selection")
+has_v2_weights = os.path.exists("model_unet_v2.pt")
+model_options = [
+    "v1: Single-Image Spatial CNN (PoC)",
+    "v2: Multi-Image U-Net (Skip Connections)",
+] if has_v2_weights else ["v1: Single-Image Spatial CNN (PoC)"]
+
+model_choice = st.sidebar.radio(
+    "Select Model Architecture:",
+    options=model_options,
+    help="v1 is trained on the single mountain photo; v2 is trained on diverse multi-scale patches with skip connections.",
+)
+
 run_btn = st.sidebar.button("Add Noise & Reconstruct", type="primary", use_container_width=True)
 
 
 @st.cache_resource
-def get_models():
+def get_v1_models():
     return load_trained_models("model.pt")
 
 
-cnn_model, baseline_model = get_models()
+@st.cache_resource
+def get_v2_model():
+    if not os.path.exists("model_unet_v2.pt"):
+        return None
+    model_v2 = UNetDenoiserV2(in_channels=3, base_ch=32)
+    ckpt = torch.load("model_unet_v2.pt", map_location="cpu", weights_only=True)
+    model_v2.load_state_dict(ckpt["unet_v2_state_dict"])
+    model_v2.eval()
+    return model_v2
 
-# Load either the user-uploaded image or the default 64x64 mountain image
+
+cnn_v1, baseline_model = get_v1_models()
+unet_v2 = get_v2_model()
+
+# 加载干净原图
 if uploaded_file is not None:
     pil_img = Image.open(uploaded_file)
     source_label = f"Uploaded Image ({uploaded_file.name})"
@@ -81,22 +111,29 @@ else:
 
 x = preprocess_image(pil_img, size=IMAGE_SIZE)
 
-# Perform forward diffusion and model reconstruction
+# 前向加噪
 torch.manual_seed(int(seed))
 z_t, eps_t = add_noise(x, alpha_t=float(alpha_t))
 
+# 逆向重构
 with torch.no_grad():
     pred_eps_base = baseline_model(z_t)
     x_hat_base = reconstruct_image(z_t, pred_eps_base, alpha_t=float(alpha_t))
 
-    pred_eps_cnn = cnn_model(z_t)
-    x_hat_cnn = reconstruct_image(z_t, pred_eps_cnn, alpha_t=float(alpha_t))
+    if "v2" in model_choice and unet_v2 is not None:
+        pred_eps_selected = unet_v2(z_t, alpha_t=float(alpha_t))
+        active_model_name = "v2 Multi-Image U-Net"
+    else:
+        pred_eps_selected = cnn_v1(z_t)
+        active_model_name = "v1 Spatial CNN"
+
+    x_hat_selected = reconstruct_image(z_t, pred_eps_selected, alpha_t=float(alpha_t))
 
 z_display = torch.clamp(z_t, 0.0, 1.0)
 mse_noisy = compute_mse(x, z_display)
 mse_base = compute_mse(x, x_hat_base)
-mse_cnn = compute_mse(x, x_hat_cnn)
-improvement_pct = (1.0 - mse_cnn / max(mse_base, 1e-8)) * 100.0
+mse_selected = compute_mse(x, x_hat_selected)
+improvement_pct = (1.0 - mse_selected / max(mse_base, 1e-8)) * 100.0
 
 
 def tensor_to_uint8(t: torch.Tensor) -> np.ndarray:
@@ -104,16 +141,16 @@ def tensor_to_uint8(t: torch.Tensor) -> np.ndarray:
     return (arr * 255.0).astype(np.uint8)
 
 
-st.subheader(f"Reconstruction Results — {source_label}")
+st.subheader(f"Reconstruction Results — {source_label} ({active_model_name})")
 
-# Metrics Row
+# 评估指标卡片
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Noisy Observation MSE", f"{mse_noisy:.4f}")
 m2.metric("Baseline (Linear) MSE", f"{mse_base:.4f}")
-m3.metric("Improved (CNN) MSE", f"{mse_cnn:.4f}")
-m4.metric("CNN Error Reduction vs. Baseline", f"{improvement_pct:.1f}%")
+m3.metric(f"{active_model_name} MSE", f"{mse_selected:.4f}")
+m4.metric("Error Reduction vs. Baseline", f"{improvement_pct:.1f}%")
 
-# Image Comparison Row
+# 四联图像展示
 c1, c2, c3, c4 = st.columns(4)
 with c1:
     st.image(tensor_to_uint8(x), caption="1. Clean Image (x) [64×64]", use_container_width=True)
@@ -131,14 +168,18 @@ with c3:
     )
 with c4:
     st.image(
-        tensor_to_uint8(x_hat_cnn),
-        caption=f"4. Improved CNN Reconstruction | MSE: {mse_cnn:.4f}",
+        tensor_to_uint8(x_hat_selected),
+        caption=f"4. {active_model_name} Reconstruction | MSE: {mse_selected:.4f}",
         use_container_width=True,
     )
 
-st.info(
-    "**Why does the CNN outperform Linear Regression?** "
-    "The baseline linear regression model operates pixel-wise without spatial context, "
-    "shrinking noisy pixels toward the global mean color. The CNN exploits 3×3 local neighborhoods "
-    "and multi-scale spatial structure to separate high-frequency Gaussian noise from mountain ridges and clouds."
-)
+if "v2" in model_choice:
+    st.success(
+        "✨ **当前运行模型：v2 Multi-Image U-Net**。采用具备跳跃连接（Skip Connections）的下采样-上采样 U-Net 架构，"
+        "并结合了 α_t 噪声强度条件输入与多样化数据集训练，消除了单图记忆偏见，对任意图像均具备强大的去噪泛化能力！"
+    )
+else:
+    st.info(
+        "ℹ️ **当前运行模型：v1 Spatial CNN (PoC 原版)**。专门在目标雪山图上完成概念验证训练。"
+        "你可以在左侧单选框中随时切换到 v2 U-Net 对比效果！"
+    )
