@@ -181,5 +181,5 @@ if "v2" in model_choice:
 else:
     st.info(
         "ℹ️ **当前运行模型：v1 Spatial CNN (PoC 原版)**。专门在目标雪山图上完成概念验证训练。"
-        "你可以在左侧单选框中随时切换到 v2 U-Net 对比效果！"
+        "可以在左侧单选框中随时切换到 v2 U-Net 对比效果！"
     )
